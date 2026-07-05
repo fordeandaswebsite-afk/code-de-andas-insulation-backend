@@ -6,213 +6,505 @@ const crypto = require('crypto');
 const axios = require('axios');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
 
-// Security middleware
 app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
       styleSrc: ["'self'", "'unsafe-inline'"],
-      imgSrc: ["'self'", "data:", "https:"]
+      imgSrc: ["'self'", "data:", "https:"],
+      scriptSrc: ["'self'", "'unsafe-inline'"],
+      connectSrc: ["'self'", "https://api.json.io"]
     }
-  }
+  },
+  hsts: {
+    maxAge: 31536000,
+    includeSubDomains: true,
+    preload: true
+  },
+  noSniff: true,
+  referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
+  frameguard: { action: 'deny' },
+  xssFilter: true
 }));
 
-// CORS configuration - restrict to specific origins
-const allowedOrigins = process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : ['http://localhost:3000'];
+const allowedOrigins = [
+  'https://deandasinsulation.netlify.app',
+  'https://cool-meringue-2f6c83.netlify.app',
+  'http://localhost:3000'
+];
 
 app.use(cors({
   origin: function(origin, callback) {
-    // Allow requests with no origin (like mobile apps, curl, etc.)
     if (!origin) return callback(null, true);
-    if (allowedOrigins.indexOf(origin) === -1) {
-      return callback(new Error('Not allowed by CORS'), false);
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
     }
-    return callback(null, true);
+    console.warn(`Origen no permitido: ${origin}`);
+    return callback(new Error('Not allowed by CORS'), false);
   },
-  credentials: true
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key', 'X-Request-Signature'],
+  exposedHeaders: ['X-RateLimit-Limit', 'X-RateLimit-Remaining'],
+  maxAge: 86400
 }));
 
-// Rate limiting: 1000 requests per minute
 const limiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minute
-  max: 1000, // limit each IP to 1000 requests per windowMs
+  windowMs: 60 * 1000,
+  max: 1000,
   message: {
-    error: 'Too many requests from this IP, please try again later.',
+    error: 'Rate limit exceeded',
+    message: 'Has superado el límite de 1000 peticiones por minuto',
     retryAfter: '60 seconds'
   },
   standardHeaders: true,
   legacyHeaders: false,
-  // Skip rate limiting for health checks
+  keyGenerator: (req) => {
+    const apiKey = req.headers['x-api-key'] || 'anonymous';
+    const ip = req.ip || req.connection.remoteAddress;
+    return `${ip}:${apiKey}`;
+  },
   skip: (req) => req.path === '/health'
 });
 
 app.use(limiter);
 
-// Middleware to verify request origin
-const verifyRequestOrigin = (req, res, next) => {
-  const expectedOrigin = process.env.EXPECTED_ORIGIN || 'https://your-frontend-domain.com';
-  const requestOrigin = req.headers.origin || req.headers.referer;
-  
-  // Skip verification for internal requests or health checks
-  if (req.path === '/health' || req.path === '/api/proxy') {
+app.use(express.json({ 
+  limit: '10mb',
+  verify: (req, res, buf) => {
+    try {
+      JSON.parse(buf);
+    } catch (e) {
+      res.status(400).json({ error: 'Invalid JSON' });
+      throw new Error('Invalid JSON');
+    }
+  }
+}));
+
+app.use(express.urlencoded({ 
+  extended: true, 
+  limit: '10mb' 
+}));
+
+const validateInput = (req, res, next) => {
+  if (req.path === '/health' || req.path === '/api/status') {
     return next();
   }
-  
-  if (!requestOrigin) {
-    return res.status(403).json({
-      error: 'Request origin verification failed',
-      message: 'Missing origin header'
-    });
+
+  if (['POST', 'PUT', 'PATCH'].includes(req.method)) {
+    if (!req.body || Object.keys(req.body).length === 0) {
+      return res.status(400).json({
+        error: 'Bad Request',
+        message: 'El body de la petición no puede estar vacío'
+      });
+    }
+
+    const bodySize = JSON.stringify(req.body).length;
+    if (bodySize > 10 * 1024 * 1024) {
+      return res.status(413).json({
+        error: 'Payload Too Large',
+        message: 'El body excede el límite de 10MB'
+      });
+    }
+
+    const sanitizeString = (obj) => {
+      if (typeof obj === 'string') {
+        return obj.replace(/[<>]/g, '');
+      }
+      if (typeof obj === 'object' && obj !== null) {
+        for (let key in obj) {
+          obj[key] = sanitizeString(obj[key]);
+        }
+      }
+      return obj;
+    };
+
+    req.body = sanitizeString(req.body);
   }
-  
-  // Simple origin verification - in production, use more robust validation
-  const originUrl = new URL(requestOrigin);
-  if (originUrl.origin !== expectedOrigin) {
-    return res.status(403).json({
-      error: 'Request origin verification failed',
-      message: 'Request origin does not match expected origin'
-    });
-  }
-  
+
   next();
 };
 
-app.use(verifyRequestOrigin);
+app.use(validateInput);
 
-// JSON parsing with size limit
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+const verifyOrigin = (req, res, next) => {
+  if (req.path === '/health' || req.path === '/api/status') {
+    return next();
+  }
 
-// Request signature verification (optional but recommended)
-const verifyRequestSignature = (req, res, next) => {
-  const signature = req.headers['x-request-signature'];
+  const requestOrigin = req.headers.origin || req.headers.referer;
+  
+  if (!requestOrigin) {
+    if (process.env.NODE_ENV === 'production') {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Request origin required'
+      });
+    }
+    return next();
+  }
+
+  try {
+    const originUrl = new URL(requestOrigin);
+    const isAllowed = allowedOrigins.some(allowed => {
+      try {
+        const allowedUrl = new URL(allowed);
+        return originUrl.origin === allowedUrl.origin;
+      } catch {
+        return false;
+      }
+    });
+
+    if (!isAllowed) {
+      console.warn(`Origen no verificado: ${requestOrigin}`);
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Request origin not authorized'
+      });
+    }
+  } catch (error) {
+    console.error('Error verificando origen:', error);
+    return res.status(400).json({
+      error: 'Bad Request',
+      message: 'Invalid origin format'
+    });
+  }
+
+  next();
+};
+
+app.use(verifyOrigin);
+
+const verifyApiKey = (req, res, next) => {
+  if (req.path === '/health' || req.path === '/api/status') {
+    return next();
+  }
+
+  const apiKey = req.headers['x-api-key'] || req.headers['authorization'];
+  const expectedApiKey = process.env.JSON_IO_API_KEY;
+
+  if (!expectedApiKey) {
+    console.error('API Key no configurada en variables de entorno');
+    return res.status(500).json({
+      error: 'Server Configuration Error',
+      message: 'API Key not configured'
+    });
+  }
+
+  if (!apiKey) {
+    return res.status(401).json({
+      error: 'Unauthorized',
+      message: 'API Key required. Enviar en header: X-API-Key'
+    });
+  }
+
+  const cleanApiKey = apiKey.replace(/^Bearer\s+/i, '');
+
+  if (cleanApiKey.length < 8) {
+    return res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Invalid API Key format'
+    });
+  }
+
+  if (cleanApiKey !== expectedApiKey) {
+    console.warn(`API Key inválida desde ${req.ip}`);
+    return res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Invalid API Key'
+    });
+  }
+
+  req.validatedApiKey = cleanApiKey;
+  next();
+};
+
+app.use(verifyApiKey);
+
+const verifySignature = (req, res, next) => {
+  if (req.path === '/health' || req.path === '/api/status') {
+    return next();
+  }
+
   const secret = process.env.REQUEST_SECRET;
   
   if (!secret) {
-    return next(); // Skip if no secret configured
+    return next();
   }
+
+  const signature = req.headers['x-request-signature'];
   
   if (!signature) {
     return res.status(401).json({
-      error: 'Authentication failed',
-      message: 'Missing request signature'
+      error: 'Unauthorized',
+      message: 'X-Request-Signature header required'
     });
   }
-  
-  // Create HMAC signature of request body
-  const body = JSON.stringify(req.body);
-  const expectedSignature = crypto
-    .createHmac('sha256', secret)
-    .update(body)
-    .digest('hex');
-  
-  if (signature !== expectedSignature) {
-    return res.status(401).json({
-      error: 'Authentication failed',
-      message: 'Invalid request signature'
+
+  try {
+    const bodyString = JSON.stringify(req.body);
+    const expectedSignature = crypto
+      .createHmac('sha256', secret)
+      .update(bodyString)
+      .digest('hex');
+
+    const isValid = crypto.timingSafeEqual(
+      Buffer.from(signature),
+      Buffer.from(expectedSignature)
+    );
+
+    if (!isValid) {
+      console.warn(`Firma inválida desde ${req.ip}`);
+      return res.status(401).json({
+        error: 'Unauthorized',
+        message: 'Invalid request signature'
+      });
+    }
+  } catch (error) {
+    console.error('Error verificando firma:', error);
+    return res.status(500).json({
+      error: 'Internal Server Error',
+      message: 'Error verifying signature'
     });
   }
-  
+
   next();
 };
 
-app.use(verifyRequestSignature);
+app.use(verifySignature);
 
-// Health check endpoint
+app.all('/api/proxy/*', async (req, res) => {
+  const startTime = Date.now();
+  
+  try {
+    const jsonIoUrl = process.env.JSON_IO_URL || 'https://api.json.io';
+    const apiKey = process.env.JSON_IO_API_KEY;
+    
+    if (!jsonIoUrl || !apiKey) {
+      console.error('Credenciales de JSON.io no configuradas');
+      return res.status(500).json({
+        error: 'Configuration Error',
+        message: 'JSON.io credentials not configured'
+      });
+    }
+
+    try {
+      new URL(jsonIoUrl);
+    } catch {
+      return res.status(500).json({
+        error: 'Configuration Error',
+        message: 'Invalid JSON.io URL'
+      });
+    }
+
+    const targetPath = req.params[0] || '';
+    
+    if (/[;&|<>$]/.test(targetPath)) {
+      return res.status(400).json({
+        error: 'Bad Request',
+        message: 'Invalid characters in path'
+      });
+    }
+
+    const targetUrl = `${jsonIoUrl}/${targetPath}`;
+
+    if (process.env.NODE_ENV === 'production' && !targetUrl.startsWith('https://')) {
+      return res.status(500).json({
+        error: 'Security Error',
+        message: 'HTTPS required in production'
+      });
+    }
+
+    const headers = {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+      'User-Agent': 'Web-Insulation-API/1.0',
+      'X-Request-ID': crypto.randomUUID()
+    };
+
+    console.log(`[${new Date().toISOString()}] ${req.method} ${targetUrl} desde ${req.ip}`);
+
+    const config = {
+      method: req.method,
+      url: targetUrl,
+      headers: headers,
+      timeout: 30000,
+      validateStatus: () => true,
+      maxRedirects: 5,
+      maxContentLength: 10 * 1024 * 1024
+    };
+
+    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method.toUpperCase())) {
+      config.data = req.body;
+    }
+
+    if (Object.keys(req.query).length > 0) {
+      config.params = req.query;
+    }
+
+    const response = await axios(config);
+
+    const duration = Date.now() - startTime;
+    console.log(`[${new Date().toISOString()}] ${req.method} ${targetUrl} - ${response.status} - ${duration}ms`);
+
+    res.status(response.status).json(response.data);
+
+  } catch (error) {
+    const duration = Date.now() - startTime;
+    console.error(`[${new Date().toISOString()}] Error: ${error.message} - ${duration}ms`);
+
+    if (error.code === 'ECONNABORTED') {
+      return res.status(504).json({
+        error: 'Gateway Timeout',
+        message: 'La petición a JSON.io excedió el tiempo de espera (30s)',
+        code: 'TIMEOUT'
+      });
+    }
+
+    if (error.response) {
+      return res.status(error.response.status).json({
+        error: 'JSON.io Error',
+        message: error.response.data?.message || 'Error en el servicio externo',
+        status: error.response.status,
+        code: 'UPSTREAM_ERROR'
+      });
+    }
+
+    if (error.request) {
+      return res.status(502).json({
+        error: 'Bad Gateway',
+        message: 'No se pudo conectar con JSON.io',
+        code: 'CONNECTION_ERROR'
+      });
+    }
+
+    res.status(500).json({
+      error: 'Internal Server Error',
+      message: 'Error procesando la petición',
+      code: 'INTERNAL_ERROR'
+    });
+  }
+});
+
 app.get('/health', (req, res) => {
   res.status(200).json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
-    uptime: process.uptime()
+    uptime: process.uptime(),
+    environment: process.env.NODE_ENV || 'development',
+    version: '1.0.0',
+    rateLimit: {
+      max: 1000,
+      window: '1 minute'
+    }
   });
 });
 
-// API proxy endpoint to forward requests to json.io
-app.post('/api/proxy', async (req, res) => {
-  try {
-    const jsonIoUrl = process.env.JSON_IO_URL || 'https://json.io';
-    const requestData = req.body;
-    
-    // Validate request data
-    if (!requestData) {
-      return res.status(400).json({
-        error: 'Bad Request',
-        message: 'Request body is required'
-      });
-    }
-    
-    // Forward request to json.io
-    const response = await axios.post(`${jsonIoUrl}/api`, requestData, {
-      headers: {
-        'Content-Type': 'application/json',
-        'User-Agent': 'Node-API-Server/1.0'
-      },
-      timeout: 30000 // 30 second timeout
-    });
-    
-    res.status(response.status).json(response.data);
-    
-  } catch (error) {
-    console.error('Error forwarding request to json.io:', error.message);
-    
-    if (error.response) {
-      // The request was made and the server responded with a status code
-      res.status(error.response.status).json({
-        error: 'Upstream Error',
-        message: error.response.data?.message || 'Error from json.io',
-        status: error.response.status
-      });
-    } else if (error.request) {
-      // The request was made but no response was received
-      res.status(502).json({
-        error: 'Bad Gateway',
-        message: 'Unable to reach json.io server'
-      });
-    } else {
-      // Something happened in setting up the request
-      res.status(500).json({
-        error: 'Internal Server Error',
-        message: 'An unexpected error occurred'
-      });
-    }
-  }
-});
-
-// Additional API endpoints can be added here
 app.get('/api/status', (req, res) => {
   res.json({
     status: 'API running',
     timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
     rateLimit: {
       windowMs: 60 * 1000,
       maxRequests: 1000
+    },
+    cors: {
+      allowedOrigins: allowedOrigins,
+      count: allowedOrigins.length
+    },
+    security: {
+      helmet: true,
+      cors: true,
+      rateLimit: true,
+      apiKey: true,
+      signature: !!process.env.REQUEST_SECRET
+    },
+    endpoints: {
+      health: '/health',
+      status: '/api/status',
+      proxy: '/api/proxy/*'
+    },
+    environment: process.env.NODE_ENV || 'development'
+  });
+});
+
+app.use('*', (req, res) => {
+  res.status(404).json({
+    error: 'Not Found',
+    message: `El endpoint '${req.originalUrl}' no existe`,
+    availableEndpoints: {
+      health: {
+        path: '/health',
+        method: 'GET',
+        description: 'Health check'
+      },
+      status: {
+        path: '/api/status',
+        method: 'GET',
+        description: 'API status'
+      },
+      proxy: {
+        path: '/api/proxy/*',
+        method: 'ALL',
+        description: 'Proxy a JSON.io'
+      }
+    },
+    requiredHeaders: {
+      'X-API-Key': 'Tu API Key de JSON.io',
+      'X-Request-Signature': 'Opcional - Firma HMAC-SHA256 del body'
     }
   });
 });
 
-// Error handling middleware
 app.use((err, req, res, next) => {
-  console.error(err.stack);
-  res.status(err.status || 500).json({
+  console.error('Error no manejado:', err.stack);
+  
+  const errorResponse = {
     error: err.name || 'Internal Server Error',
-    message: err.message || 'Something went wrong!'
-  });
-});
+    message: err.message || 'Error interno del servidor'
+  };
 
-// 404 handler
-app.use('*', (req, res) => {
-  res.status(404).json({
-    error: 'Not Found',
-    message: `Route ${req.originalUrl} not found`
-  });
-});
+  if (process.env.NODE_ENV !== 'production') {
+    errorResponse.stack = err.stack;
+  }
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-  console.log(`Rate limit: 1000 requests per minute`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
+  res.status(err.status || 500).json(errorResponse);
 });
 
 module.exports = app;
+
+if (require.main === module) {
+  const PORT = process.env.PORT || 3000;
+  
+  console.log('Verificando configuración...');
+  
+  if (!process.env.JSON_IO_API_KEY) {
+    console.warn('WARNING: JSON_IO_API_KEY no configurada');
+  }
+  
+  if (!process.env.JSON_IO_URL) {
+    console.warn('WARNING: JSON_IO_URL no configurada, usando default');
+  }
+  
+  const server = app.listen(PORT, () => {
+    console.log('\n=====================================');
+    console.log(`API funcionando en http://localhost:${PORT}`);
+    console.log('=====================================');
+    console.log(`Rate limit: 1000 requests/minuto`);
+    console.log(`Health: http://localhost:${PORT}/health`);
+    console.log(`Status: http://localhost:${PORT}/api/status`);
+    console.log(`Proxy: http://localhost:${PORT}/api/proxy/*`);
+    console.log('=====================================');
+  });
+
+  process.on('SIGTERM', () => {
+    console.log('Recibido SIGTERM, cerrando servidor...');
+    server.close(() => {
+      console.log('Servidor cerrado');
+      process.exit(0);
+    });
+  });
+}
