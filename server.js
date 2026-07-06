@@ -87,6 +87,96 @@ app.use(express.urlencoded({
   limit: '10mb' 
 }));
 
+// ============================================
+// SISTEMA DE CONVERSIÓN DE < Y > A HTML ENTITIES
+// ============================================
+
+// Función para convertir caracteres peligrosos a HTML entities
+function convertToHtmlEntities(text) {
+  if (typeof text !== 'string') return text;
+  
+  const htmlEntities = {
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#x27;',
+    '&': '&amp;',
+    '/': '&#x2F;'
+  };
+  
+  return text.replace(/[<>"'&/]/g, function(char) {
+    return htmlEntities[char] || char;
+  });
+}
+
+// Función recursiva para sanitizar objetos completos
+function sanitizeObject(obj) {
+  if (obj === null || obj === undefined) return obj;
+  
+  if (typeof obj === 'string') {
+    return convertToHtmlEntities(obj);
+  }
+  
+  if (Array.isArray(obj)) {
+    return obj.map(item => sanitizeObject(item));
+  }
+  
+  if (typeof obj === 'object') {
+    const sanitized = {};
+    for (let key in obj) {
+      if (obj.hasOwnProperty(key)) {
+        sanitized[key] = sanitizeObject(obj[key]);
+      }
+    }
+    return sanitized;
+  }
+  
+  return obj;
+}
+
+// Función para sanitizar SOLO campos específicos (texto, review, comentarios)
+function sanitizeSensitiveFields(obj) {
+  if (obj === null || obj === undefined) return obj;
+  
+  // Campos que pueden contener texto peligroso
+  const sensitiveFields = [
+    'text', 'review', 'comment', 'message', 'name', 'author', 
+    'title', 'description', 'content', 'body', 'feedback',
+    'opinion', 'reviewText', 'commentText'
+  ];
+  
+  if (typeof obj === 'string') {
+    return convertToHtmlEntities(obj);
+  }
+  
+  if (Array.isArray(obj)) {
+    return obj.map(item => sanitizeSensitiveFields(item));
+  }
+  
+  if (typeof obj === 'object') {
+    const sanitized = {};
+    for (let key in obj) {
+      if (obj.hasOwnProperty(key)) {
+        // Si es un campo sensible, sanitizar
+        if (sensitiveFields.includes(key.toLowerCase())) {
+          sanitized[key] = convertToHtmlEntities(obj[key]);
+        } else if (typeof obj[key] === 'object') {
+          sanitized[key] = sanitizeSensitiveFields(obj[key]);
+        } else {
+          sanitized[key] = obj[key];
+        }
+      }
+    }
+    return sanitized;
+  }
+  
+  return obj;
+}
+
+// ============================================
+// MIDDLEWARE DE SANITIZACIÓN MEJORADO
+// ============================================
+
 const validateInput = (req, res, next) => {
   if (req.path === '/health' || req.path === '/api/status') {
     return next();
@@ -108,19 +198,12 @@ const validateInput = (req, res, next) => {
       });
     }
 
-    const sanitizeString = (obj) => {
-      if (typeof obj === 'string') {
-        return obj.replace(/[<>]/g, '');
-      }
-      if (typeof obj === 'object' && obj !== null) {
-        for (let key in obj) {
-          obj[key] = sanitizeString(obj[key]);
-        }
-      }
-      return obj;
-    };
-
-    req.body = sanitizeString(req.body);
+    // === NUEVO: Sanitización completa con conversión de < y > ===
+    // Opción 1: Sanitizar TODOS los strings (más seguro)
+    req.body = sanitizeObject(req.body);
+    
+    // Opción 2: Sanitizar SOLO campos sensibles (menos intrusivo)
+    // req.body = sanitizeSensitiveFields(req.body);
   }
 
   next();
@@ -420,7 +503,9 @@ app.get('/api/status', (req, res) => {
       cors: true,
       rateLimit: true,
       apiKey: true,
-      signature: !!process.env.REQUEST_SECRET
+      signature: !!process.env.REQUEST_SECRET,
+      htmlSanitization: true,
+      xssProtection: true
     },
     endpoints: {
       health: '/health',
@@ -497,6 +582,13 @@ if (require.main === module) {
     console.log(`Health: http://localhost:${PORT}/health`);
     console.log(`Status: http://localhost:${PORT}/api/status`);
     console.log(`Proxy: http://localhost:${PORT}/api/proxy/*`);
+    console.log('=====================================');
+    console.log('🛡️ Seguridad activa:');
+    console.log('  ✅ Helmet (headers seguros)');
+    console.log('  ✅ CORS (lista blanca)');
+    console.log('  ✅ Rate Limiting (1000/min)');
+    console.log('  ✅ Sanitización HTML (< > → &lt; &gt;)');
+    console.log('  ✅ Protección XSS');
     console.log('=====================================');
   });
 
