@@ -34,6 +34,46 @@ const allowedOrigins = [
   'http://localhost:3000'
 ];
 
+// IPs permitidas (whitelist)
+const allowedIPs = [
+  '202.5.98.202',
+  // Puedes agregar más IPs aquí
+];
+
+// Middleware para verificar IP
+const verifyIP = (req, res, next) => {
+  // Obtener IP real (considerando proxies)
+  const clientIP = req.headers['x-forwarded-for'] || 
+                   req.connection.remoteAddress || 
+                   req.socket.remoteAddress || 
+                   req.ip;
+  
+  // Limpiar IP (remover puerto si existe)
+  const cleanIP = clientIP.replace(/:\d+$/, '').replace(/^::ffff:/, '');
+  
+  // Si la IP está en la lista blanca, permitir
+  if (allowedIPs.includes(cleanIP)) {
+    console.log(`✅ IP permitida: ${cleanIP}`);
+    return next();
+  }
+  
+  // Si no está en la lista blanca, bloquear
+  console.warn(`🔒 IP bloqueada: ${cleanIP}`);
+  return res.status(403).json({
+    error: 'Forbidden',
+    message: 'IP no autorizada',
+    ip: cleanIP
+  });
+};
+
+// Aplicar verificación de IP a TODAS las rutas (excepto health)
+app.use((req, res, next) => {
+  if (req.path === '/health') {
+    return next();
+  }
+  verifyIP(req, res, next);
+});
+
 app.use(cors({
   origin: function(origin, callback) {
     if (!origin) return callback(null, true);
@@ -198,12 +238,8 @@ const validateInput = (req, res, next) => {
       });
     }
 
-    // === NUEVO: Sanitización completa con conversión de < y > ===
-    // Opción 1: Sanitizar TODOS los strings (más seguro)
+    // Sanitización completa con conversión de < y >
     req.body = sanitizeObject(req.body);
-    
-    // Opción 2: Sanitizar SOLO campos sensibles (menos intrusivo)
-    // req.body = sanitizeSensitiveFields(req.body);
   }
 
   next();
@@ -481,7 +517,8 @@ app.get('/health', (req, res) => {
     rateLimit: {
       max: 1000,
       window: '1 minute'
-    }
+    },
+    allowedIPs: allowedIPs
   });
 });
 
@@ -505,7 +542,12 @@ app.get('/api/status', (req, res) => {
       apiKey: true,
       signature: !!process.env.REQUEST_SECRET,
       htmlSanitization: true,
-      xssProtection: true
+      xssProtection: true,
+      ipWhitelist: true
+    },
+    ipWhitelist: {
+      allowedIPs: allowedIPs,
+      count: allowedIPs.length
     },
     endpoints: {
       health: '/health',
@@ -576,12 +618,12 @@ if (require.main === module) {
   
   const server = app.listen(PORT, () => {
     console.log('\n=====================================');
-    console.log(`API funcionando en http://localhost:${PORT}`);
+    console.log(`✅ API funcionando en http://localhost:${PORT}`);
     console.log('=====================================');
-    console.log(`Rate limit: 1000 requests/minuto`);
-    console.log(`Health: http://localhost:${PORT}/health`);
-    console.log(`Status: http://localhost:${PORT}/api/status`);
-    console.log(`Proxy: http://localhost:${PORT}/api/proxy/*`);
+    console.log(`📊 Rate limit: 1000 requests/minuto`);
+    console.log(`🔄 Health: http://localhost:${PORT}/health`);
+    console.log(`📡 Status: http://localhost:${PORT}/api/status`);
+    console.log(`📡 Proxy: http://localhost:${PORT}/api/proxy/*`);
     console.log('=====================================');
     console.log('🛡️ Seguridad activa:');
     console.log('  ✅ Helmet (headers seguros)');
@@ -589,6 +631,8 @@ if (require.main === module) {
     console.log('  ✅ Rate Limiting (1000/min)');
     console.log('  ✅ Sanitización HTML (< > → &lt; &gt;)');
     console.log('  ✅ Protección XSS');
+    console.log('  ✅ IP Whitelist');
+    console.log(`  📌 IPs permitidas: ${allowedIPs.join(', ')}`);
     console.log('=====================================');
   });
 
